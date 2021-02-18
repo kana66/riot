@@ -441,8 +441,6 @@ func (indexer *Indexer) internalLookup(
 		indexPointers[iTable] = indexer.getIndexLen(table[iTable]) - 1
 	}
 
-	// 平均文本关键词长度，用于计算BM25
-	avgDocLength := indexer.totalTokenLen / float32(indexer.numDocs)
 	for ; indexPointers[0] >= 0; indexPointers[0]-- {
 		// 以第一个搜索键出现的文档作为基准，并遍历其他搜索键搜索同一文档
 		baseDocId := indexer.getDocId(table[0], indexPointers[0])
@@ -520,31 +518,7 @@ func (indexer *Indexer) internalLookup(
 				}
 			}
 
-			// 当为 LocsIndex 或者 FrequenciesIndex 时计算BM25
-			if indexer.initOptions.IndexType == types.LocsIndex ||
-				indexer.initOptions.IndexType == types.FrequenciesIndex {
-				bm25 := float32(0)
-				d := indexer.docTokenLens[baseDocId]
-				for i, t := range table[:len(tokens)] {
-					var frequency float32
-					if indexer.initOptions.IndexType == types.LocsIndex {
-						frequency = float32(len(t.locations[indexPointers[i]]))
-					} else {
-						frequency = t.frequencies[indexPointers[i]]
-					}
-
-					// 计算 BM25
-					if len(t.docIds) > 0 && frequency > 0 &&
-						indexer.initOptions.BM25Parameters != nil && avgDocLength != 0 {
-						// 带平滑的 idf
-						idf := float32(math.Log2(float64(indexer.numDocs)/float64(len(t.docIds)) + 1))
-						k1 := indexer.initOptions.BM25Parameters.K1
-						b := indexer.initOptions.BM25Parameters.B
-						bm25 += idf * frequency * (k1 + 1) / (frequency + k1*(1-b+b*d/avgDocLength))
-					}
-				}
-				indexedDoc.BM25 = float32(bm25)
-			}
+			indexedDoc.BM25 = indexer.getBM25(table, tokens)
 
 			indexedDoc.DocId = baseDocId
 			if !countDocsOnly {
@@ -643,6 +617,7 @@ func (indexer *Indexer) LogicLookup(
 			if mustFound && shouldFound && !notInFound {
 				indexedDoc := types.IndexedDoc{}
 				indexedDoc.DocId = baseDocId
+				indexedDoc.BM25 = indexer.getBM25(mustTable, logic.Expr.Must) + indexer.getBM25(shouldTable, logic.Expr.Should)
 				if !countDocsOnly {
 					docs = append(docs, indexedDoc)
 				}
@@ -657,6 +632,9 @@ func (indexer *Indexer) LogicLookup(
 	// 这时进行求并集操作
 	if logic.Should == true || len(logic.Expr.Should) > 0 {
 		docs, numDocs = indexer.unionTable(shouldTable, notInTable, countDocsOnly)
+		for _, doc := range docs {
+			doc.BM25 = indexer.getBM25(shouldTable, logic.Expr.Should)
+		}
 	} else {
 		uintDocIds := make([]string, 0)
 		// 当前直接返回 Not 逻辑数据
@@ -866,9 +844,7 @@ func (indexer *Indexer) findInNotInTable(table []*KeywordIndices, docId string) 
 // unionTable 如果不存在与逻辑检索， 则需要对逻辑或反向表求并集
 // 先求差集再求并集， 可以减小内存占用
 // docid 要保序
-func (indexer *Indexer) unionTable(table []*KeywordIndices,
-	notInTable []*KeywordIndices, countDocsOnly bool) (
-	docs []types.IndexedDoc, numDocs int) {
+func (indexer *Indexer) unionTable(table []*KeywordIndices, notInTable []*KeywordIndices, countDocsOnly bool) (docs []types.IndexedDoc, numDocs int) {
 	docIds := make([]string, 0)
 	// 求并集
 	for i := 0; i < len(table); i++ {
@@ -901,5 +877,58 @@ func (indexer *Indexer) unionTable(table []*KeywordIndices,
 		numDocs++
 	}
 
+	return
+}
+
+func (indexer *Indexer) getBM25(table []*KeywordIndices, tokens []string) (bm25 float32) {
+	bm25 = float32(0)
+	if len(table) == 0 || len(tokens) == 0 {
+		return
+	}
+	var keywords []string
+	for _, token := range tokens {
+		if _, found := indexer.tableLock.table[token]; found {
+			keywords = append(keywords, token)
+		}
+	}
+
+	// 平均文本关键词长度，用于计算BM25
+	avgDocLength := indexer.totalTokenLen / float32(indexer.numDocs)
+
+	// 归并查找各个搜索键出现文档的交集
+	// 从后向前查保证先输出 DocId 较大文档
+	indexPointers := make([]int, len(table))
+	for iTable := 0; iTable < len(table); iTable++ {
+		indexPointers[iTable] = indexer.getIndexLen(table[iTable]) - 1
+	}
+
+	for ; indexPointers[0] >= 0; indexPointers[0]-- {
+		// 以第一个搜索键出现的文档作为基准，并遍历其他搜索键搜索同一文档
+		baseDocId := indexer.getDocId(table[0], indexPointers[0])
+		// 当为 LocsIndex 或者 FrequenciesIndex 时计算BM25
+		if indexer.initOptions.IndexType == types.LocsIndex ||
+			indexer.initOptions.IndexType == types.FrequenciesIndex {
+
+			d := indexer.docTokenLens[baseDocId]
+			for i, t := range table[:len(keywords)] {
+				var frequency float32
+				if indexer.initOptions.IndexType == types.LocsIndex {
+					frequency = float32(len(t.locations[indexPointers[i]]))
+				} else {
+					frequency = t.frequencies[indexPointers[i]]
+				}
+
+				// 计算 BM25
+				if len(t.docIds) > 0 && frequency > 0 &&
+					indexer.initOptions.BM25Parameters != nil && avgDocLength != 0 {
+					// 带平滑的 idf
+					idf := float32(math.Log2(float64(indexer.numDocs)/float64(len(t.docIds)) + 1))
+					k1 := indexer.initOptions.BM25Parameters.K1
+					b := indexer.initOptions.BM25Parameters.B
+					bm25 += idf * frequency * (k1 + 1) / (frequency + k1*(1-b+b*d/avgDocLength))
+				}
+			}
+		}
+	}
 	return
 }
